@@ -8,7 +8,7 @@ sample.env
 # compiled output
 /dist
 /node_modules
-
+/frontend/node_modules
 # Logs
 logs
 *.log
