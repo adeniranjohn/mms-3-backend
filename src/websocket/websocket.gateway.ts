@@ -8,25 +8,34 @@ import {
 } from "@nestjs/websockets";
 import { Logger, UnauthorizedException, UseGuards } from "@nestjs/common";
 import { Server, Socket } from "socket.io";
-import { ChatService } from "./chat.service";
+import { ChatService } from "src/chat/chat.service";
 import { JwtService } from "@nestjs/jwt";
 import { ConfigService } from "@nestjs/config";
 import { JwtWebSocketGuard } from "src/auth/guards/ws.auth.guard";
+
+import {
+  MarkMessageAsDeliveredDto,
+  BroadCastMessage,
+  TypingDto,
+  CreateMessageDto,
+} from "src/chat/dto/messsage.dto";
 import { UsersService } from "src/users/users.service";
+import { PreferencesService } from "src/preferences/preferences.service";
 import { MailService } from "src/mail/mail.service";
 
 @WebSocketGateway() // { cors: { origin: "http://localhost:3000" } }
-export class ChatGateway
+export class WsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
 {
-  private readonly logger = new Logger(ChatGateway.name);
+  private readonly logger = new Logger(WsGateway.name);
 
   constructor(
     private chatService: ChatService,
     private usersService: UsersService,
+    private preferenceService: PreferencesService,
     private mailService: MailService,
     private jwtService: JwtService,
-    private configService: ConfigService, // private userService: UserService,
+    private configService: ConfigService,
   ) {}
 
   @WebSocketServer()
@@ -76,6 +85,13 @@ export class ChatGateway
     this.connectedUsers.delete(uid);
   }
 
+  @UseGuards(JwtWebSocketGuard)
+  @SubscribeMessage("heartbeat")
+  handleHeartbeat(client: Socket) {
+    // Send heartbeat response
+    client.emit("heartbeatResponse");
+  }
+
   async afterInit(server: Server) {
     this.logger.debug(`Initialized! ${server}`);
   }
@@ -85,71 +101,76 @@ export class ChatGateway
     const messages = await this.chatService.getChatMessages(data.chatId);
     socket.emit("chatMessages", messages);
   }
+
   @UseGuards(JwtWebSocketGuard)
   @SubscribeMessage("sendMessage")
-  async handleSendMessage(
-    socket: Socket,
-    data: {
-      chatId: string;
-      senderId: string;
-      receiverId: string;
-      text: string | Express.Multer.File;
-    },
-  ) {
+  async handleSendMessage(socket: Socket, createMessage: CreateMessageDto) {
+    this.logger.debug(socket.data.user.sub);
+    createMessage.senderId = socket.data.user.sub;
     let message;
-    if (typeof data.text === "string") {
-      message = await this.chatService.sendMessage(
-        data.chatId,
-        data.senderId,
-        data.receiverId,
-        data.text,
-      );
+    if (typeof createMessage.text === "string") {
+      message = await this.chatService.sendMessage(createMessage);
     } else {
-      message = await this.chatService.uploadAttachment(
-        data.chatId,
-        data.senderId,
-        data.receiverId,
-        data.text,
-      );
+      message = await this.chatService.uploadAttachment(createMessage);
     }
     // list sockets
     const sockets = Array.from(this.connectedUsers.entries());
     // find receiver socket
     const receiverSocket = sockets.find(
-      ([userId]) => userId === data.receiverId,
+      ([userId]) => userId === createMessage.receiverId,
     );
     // if receiver is connected, emit message to receiver
     if (receiverSocket) {
+      this.logger;
       this.server.to(receiverSocket[1].id).emit("newMessage", message);
     }
     // if the receiver is not online, send push notification to their email
     else {
-      const receiver = await this.usersService.getUserById(data.receiverId);
-      const sender = await this.usersService.getUserById(data.senderId);
-      const message = `You have a new message from ${sender.data.email}`;
-      if (receiver) {
-        await this.mailService.sendNotificationEmail(
-          receiver.data.email,
-          message,
-        );
-      }
+      // Notifcation service(TODO||)
+      // check if user is subscribed to Direct messages notifications
+      // const preferences = await this.preferenceService.getPreferencesByUid(
+      //   createMessage.receiverId,
+      // );
+      // const isSubscribed =
+      //   preferences.data[0].discussionNotifications
+      //     .enableDirectMessageNotifications;
+      // const receiver = await this.usersService.getUserById(
+      //   createMessage.receiverId,
+      // );
+      // const sender = await this.usersService.getUserById(
+      //   createMessage.senderId,
+      // );
+      // const message = `You have a new message from ${sender.data.email}`;
+      // // check if a user has enabled email notifications for messages
+      // if (receiver && isSubscribed) {
+      //   await this.mailService.sendNotificationEmail(
+      //     receiver.data.email,
+      //     message,
+      //   );
+      // }
     }
   }
 
   @UseGuards(JwtWebSocketGuard)
   @SubscribeMessage("markMessageRead")
-  async handleMarkMessageRead(
-    socket: Socket,
-    data: { messageId: string; chatId: string },
-  ) {
+  async handleMarkMessageRead(socket: Socket, data: MarkMessageAsDeliveredDto) {
     const message = await this.chatService.markMessageRead(
       data.messageId,
       data.chatId,
     );
+    // list sockets
+    const sockets = Array.from(this.connectedUsers.entries());
+    // find receiver socket
+    const senderSocket = sockets.find(
+      ([userId]) => userId === message.senderId,
+    );
+    const receiverSocket = sockets.find(
+      ([userId]) => userId === message.receiverId,
+    );
     // Emit updated message to sender and receiver
     this.server
-      .to(message.senderId)
-      .to(message.receiverId)
+      .to(receiverSocket[1].id)
+      .to(senderSocket[1].id)
       .emit("messageRead", message);
   }
 
@@ -157,22 +178,32 @@ export class ChatGateway
   @SubscribeMessage("markMessageAsDelivered")
   async handleMarkMessageAsDelivered(
     socket: Socket,
-    data: { chatId: string; messageId: string },
+    data: MarkMessageAsDeliveredDto,
   ) {
-    await this.chatService.markMessageAsDelivered(data.chatId, data.messageId);
-    // Emit event to sender and receiver
-    this.server.to(data.chatId).emit("messageDelivered", {
-      chatId: data.chatId,
-      messageId: data.messageId,
-    });
+    const message = await this.chatService.markMessageAsDelivered(
+      data.chatId,
+      data.messageId,
+    );
+    // list sockets
+    const sockets = Array.from(this.connectedUsers.entries());
+    // find receiver socket
+    const senderSocket = sockets.find(
+      ([userId]) => userId === message.senderId,
+    );
+    const receiverSocket = sockets.find(
+      ([userId]) => userId === message.receiverId,
+    );
+    // Emit updated message to sender and receiver
+    this.server
+      .to(receiverSocket[1].id)
+      .to(senderSocket[1].id)
+      .emit("messageDelivered", message);
   }
   // start typing event
   @UseGuards(JwtWebSocketGuard)
   @SubscribeMessage("startTyping")
-  async handleStartTyping(
-    socket: Socket,
-    data: { chatId: string; senderId: string; receiverId: string },
-  ) {
+  async handleStartTyping(socket: Socket, data: TypingDto) {
+    data.receiverId = socket.data.user.sub;
     // list sockets
     const sockets = Array.from(this.connectedUsers.entries());
     // find receiver socket
@@ -192,10 +223,7 @@ export class ChatGateway
   // stop typing event
   @UseGuards(JwtWebSocketGuard)
   @SubscribeMessage("stopTyping")
-  async handleStopTyping(
-    socket: Socket,
-    data: { chatId: string; senderId: string; receiverId: string },
-  ) {
+  async handleStopTyping(socket: Socket, data: TypingDto) {
     // list sockets
     const sockets = Array.from(this.connectedUsers.entries());
     // find receiver socket
@@ -210,5 +238,29 @@ export class ChatGateway
         senderId: data.senderId,
       });
     }
+  }
+  // broadcast a chat to all users
+
+  @UseGuards(JwtWebSocketGuard)
+  @SubscribeMessage("broadcastChat")
+  async handleBroadCastMessage(socket: Socket, data: BroadCastMessage) {
+    const s_Id = socket.data.user.sub;
+
+    data.recipients.map(async (_r) => {
+      const chat = await this.chatService.createChat(_r, s_Id);
+
+      const message = {
+        senderId: s_Id,
+        receiverId: _r,
+        text: data.text,
+        chatId: chat.data.chatId,
+      };
+      this.chatService.sendMessage(message);
+
+      //TODO broadcast message if online
+      // send notification if subscribed to email
+      // send-in-app notifcation if subscribed
+    });
+    throw new Error("Not implemented yet");
   }
 }
